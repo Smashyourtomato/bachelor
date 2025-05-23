@@ -1,4 +1,6 @@
 import torch
+import numpy as np
+from tqdm import tqdm
 
 def cov_v_diff(in_v):
     in_v_tmp = in_v.clone()
@@ -63,3 +65,107 @@ def calc_inv_cov(model, device="cpu"):
     inv_cov_target = inv_cov_target.to(device).float()
     
     return inv_cov_source, inv_cov_target
+
+def calc_inv_cov_target_aware(model, target_loader, device, use_latent=False):
+    """
+    Calculate mean and inverse covariance of train_target reconstruction errors or latent features.
+    Set use_latent=True to operate in latent space.
+    """
+    model.eval()
+    features = []
+
+    for batch in tqdm(target_loader, desc="Extracting features for target-aware Mahala"):
+        x = batch[0].to(device).float()  # Ensure float32
+        with torch.no_grad():
+            if use_latent:
+                feat = model.encoder(x)  # latent features
+            else:
+                x_hat = model(x)
+                if isinstance(x_hat, tuple):
+                    x_hat = x_hat[0]
+                feat = (x - x_hat).view(x.shape[0], -1)  # recon error
+        features.append(feat.cpu().numpy().astype(np.float32))  # Ensure float32
+
+    X = np.vstack(features)
+    mean = X.mean(axis=0).astype(np.float32)  # Ensure float32
+    cov = np.cov(X, rowvar=False).astype(np.float32) + 1e-6 * np.eye(X.shape[1], dtype=np.float32)  # regularization
+    inv_cov = np.linalg.inv(cov).astype(np.float32)  # Ensure float32
+
+    return mean, inv_cov
+
+def mahalanobis_distance(X, mean, inv_cov):
+    """
+    Compute Mahalanobis distance between features X and target mean/cov.
+    """
+    delta = X - mean
+    return np.sum(delta @ inv_cov * delta, axis=1)
+
+def loss_function_mahala_target_aware(recon_x, x, mean, inv_cov, use_latent=False):
+    """
+    Compute target-aware Mahalanobis distance loss.
+    """
+    if use_latent:
+        feat = recon_x.view(recon_x.shape[0], -1)  # latent features
+    else:
+        feat = (x - recon_x).view(x.shape[0], -1)  # recon error
+    
+    # Convert to numpy for computation
+    feat_np = feat.cpu().numpy().astype(np.float32)  # Ensure float32
+    
+    # Compute Mahalanobis distance
+    distances = mahalanobis_distance(feat_np, mean, inv_cov)
+    
+    # Convert back to torch tensor with float32
+    return torch.from_numpy(distances).to(feat.device).float()  # Ensure float32
+
+def extract_latent_features(model, data_loader, device):
+    """
+    Extract latent features from the encoder for all samples in the data loader.
+    """
+    model.eval()
+    latent_list = []
+
+    for batch in tqdm(data_loader, desc="Extracting latent features"):
+        x = batch[0].to(device).float()
+        with torch.no_grad():
+            z = model.encoder(x)
+        latent_list.append(z.cpu().numpy().astype(np.float32))
+
+    return np.vstack(latent_list)
+
+def compute_mahala_stats(X):
+    """
+    Compute mean and inverse covariance matrix for Mahalanobis distance.
+    """
+    mean = np.mean(X, axis=0).astype(np.float32)
+    cov = np.cov(X, rowvar=False).astype(np.float32) + 1e-6 * np.eye(X.shape[1], dtype=np.float32)
+    inv_cov = np.linalg.inv(cov).astype(np.float32)
+    return mean, inv_cov
+
+def calc_inv_cov_target_aware_latent(model, target_loader, device):
+    """
+    Calculate mean and inverse covariance of train_target latent features.
+    """
+    # Extract latent features
+    latent_features = extract_latent_features(model, target_loader, device)
+    
+    # Compute Mahalanobis statistics
+    mean, inv_cov = compute_mahala_stats(latent_features)
+    
+    return mean, inv_cov
+
+def loss_function_mahala_target_aware_latent(recon_x, x, mean, inv_cov):
+    """
+    Compute target-aware Mahalanobis distance loss in latent space.
+    """
+    # Get latent features - no need to reshape since they're already in the right shape
+    feat = recon_x  # recon_x is actually the latent features z
+    
+    # Convert to numpy for computation
+    feat_np = feat.cpu().numpy().astype(np.float32)
+    
+    # Compute Mahalanobis distance
+    distances = mahalanobis_distance(feat_np, mean, inv_cov)
+    
+    # Convert back to torch tensor
+    return torch.from_numpy(distances).to(feat.device).float()

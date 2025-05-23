@@ -11,7 +11,11 @@ from tqdm import tqdm
 
 from networks.base_model import BaseModel
 from networks.dcase2023t2_ae.network import AENet
-from networks.criterion.mahala import cov_v, loss_function_mahala, calc_inv_cov
+from networks.criterion.mahala import (
+    cov_v, loss_function_mahala, calc_inv_cov,
+    calc_inv_cov_target_aware, loss_function_mahala_target_aware,
+    calc_inv_cov_target_aware_latent, loss_function_mahala_target_aware_latent
+)
 from tools.plot_anm_score import AnmScoreFigData
 from tools.plot_loss_curve import csv_to_figdata
 
@@ -26,7 +30,10 @@ class DCASE2023T2AE(BaseModel):
         self.optimizer = optim.Adam(parameter_list, lr=self.args.learning_rate)
         self.mse_score_distr_file_path = self.model_dir/f"score_distr_{self.args.model}_{self.args.dataset}{self.model_name_suffix}{self.eval_suffix}_seed{self.args.seed}_mse.pickle"
         self.mahala_score_distr_file_path = self.model_dir/f"score_distr_{self.args.model}_{self.args.dataset}{self.model_name_suffix}{self.eval_suffix}_seed{self.args.seed}_mahala.pickle"
-
+        
+        # Initialize target distribution parameters
+        self.mahala_mean = None
+        self.mahala_inv_cov = None
 
     def init_model(self):
         self.block_size = self.data.height
@@ -261,6 +268,24 @@ class DCASE2023T2AE(BaseModel):
         y_pred.append(min(loss_target.item(), loss_source.item()))
         return y_pred
 
+    def calc_valid_mahala_score_target_aware(self, data, y_pred, mean, inv_cov, use_latent=False):
+        """
+        Calculate target-aware Mahalanobis score for validation data.
+        """
+        data = data.to(self.device).float()
+        recon_data, _ = self.model(data)
+        
+        loss = loss_function_mahala_target_aware(
+            recon_x=recon_data,
+            x=data,
+            mean=mean,
+            inv_cov=inv_cov,
+            use_latent=use_latent
+        )
+        
+        y_pred.append(loss.mean().item())
+        return y_pred
+
     def loss_reduction_1d(self, score):
         return torch.mean(score, dim=1)
 
@@ -295,6 +320,14 @@ class DCASE2023T2AE(BaseModel):
         self.model.eval()
 
         if self.args.score == "MAHALA":
+            # Calculate target-aware Mahalanobis parameters once
+            print("\n============== CALCULATING TARGET DISTRIBUTION ==============")
+            # Use latent space for Mahalanobis scoring
+            self.mahala_mean, self.mahala_inv_cov = calc_inv_cov_target_aware_latent(
+                model=self.model,
+                target_loader=self.train_loader,
+                device=self.device
+            )
             decision_threshold = self.calc_decision_threshold(score_distr_file_path=self.mahala_score_distr_file_path)
         else:
             decision_threshold = self.calc_decision_threshold(score_distr_file_path=self.mse_score_distr_file_path)
@@ -456,29 +489,17 @@ class DCASE2023T2AE(BaseModel):
             y_true.append(batch[1][0].item())
             basename = batch[3][0]
 
-            recon_data, _ = self.model(data)
+            recon_data, z = self.model(data)
 
             if self.args.score == "MAHALA":
-                loss_source, num = loss_function_mahala(
-                    recon_x=recon_data,
+                # Use pre-computed target distribution parameters with latent features
+                loss = loss_function_mahala_target_aware_latent(
+                    recon_x=z,
                     x=data,
-                    block_size=self.block_size,
-                    cov=inv_cov_source,
-                    use_precision=True,
-                    reduction=False
+                    mean=self.mahala_mean,
+                    inv_cov=self.mahala_inv_cov
                 )
-                loss_source = self.loss_reduction(score=self.loss_reduction_1d(loss_source), n_loss=num)
-
-                loss_target, num = loss_function_mahala(
-                    recon_x=recon_data,
-                    x=data,
-                    block_size=self.block_size,
-                    cov=inv_cov_target,
-                    use_precision=True,
-                    reduction=False
-                )
-                loss_target = self.loss_reduction(score=self.loss_reduction_1d(loss_target), n_loss=num)
-                y_pred.append(min(loss_target.item(), loss_source.item()))
+                y_pred.append(loss.mean().item())
             else:
                 y_pred.append(self.loss_fn(recon_x=recon_data, x=data).mean().item())
             
