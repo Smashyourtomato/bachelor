@@ -124,48 +124,132 @@ def extract_latent_features(model, data_loader, device):
     """
     model.eval()
     latent_list = []
+    filenames = []
 
     for batch in tqdm(data_loader, desc="Extracting latent features"):
         x = batch[0].to(device).float()
         with torch.no_grad():
             z = model.encoder(x)
         latent_list.append(z.cpu().numpy().astype(np.float32))
+        filenames.extend(batch[3])  # Store filenames
 
-    return np.vstack(latent_list)
+    return np.vstack(latent_list), filenames
 
-def compute_mahala_stats(X):
+def compute_latent_stats(X, use_ledoit_wolf=False):
     """
-    Compute mean and inverse covariance matrix for Mahalanobis distance.
+    Compute mean and inverse covariance matrix for latent features.
+    
+    Args:
+        X (np.ndarray): Latent features
+        use_ledoit_wolf (bool): Whether to use Ledoit-Wolf covariance estimation
+        
+    Returns:
+        tuple: (mean, inv_cov)
     """
+    if len(X) == 0:
+        return None, None
+        
     mean = np.mean(X, axis=0).astype(np.float32)
-    cov = np.cov(X, rowvar=False).astype(np.float32) + 1e-6 * np.eye(X.shape[1], dtype=np.float32)
-    inv_cov = np.linalg.inv(cov).astype(np.float32)
+    if use_ledoit_wolf:
+        from sklearn.covariance import LedoitWolf
+        cov = LedoitWolf().fit(X).covariance_.astype(np.float32)
+    else:
+        cov = np.cov(X, rowvar=False).astype(np.float32)
+        # Add small diagonal term for numerical stability
+        cov = cov + 1e-6 * np.eye(X.shape[1], dtype=np.float32)
+    
+    try:
+        inv_cov = np.linalg.inv(cov).astype(np.float32)
+    except np.linalg.LinAlgError:
+        # If matrix is singular, use pseudo-inverse
+        inv_cov = np.linalg.pinv(cov).astype(np.float32)
+    
     return mean, inv_cov
 
-def calc_inv_cov_target_aware_latent(model, target_loader, device):
+def blend_stats(mu_src, cov_src, mu_tgt, cov_tgt, alpha=0.7):
     """
-    Calculate mean and inverse covariance of train_target latent features.
+    Blend source and target statistics.
+    
+    Args:
+        mu_src (np.ndarray): Source mean
+        cov_src (np.ndarray): Source inverse covariance
+        mu_tgt (np.ndarray): Target mean
+        cov_tgt (np.ndarray): Target inverse covariance
+        alpha (float): Weight for source statistics (0-1)
+        
+    Returns:
+        tuple: (blended_mean, blended_inv_cov)
     """
-    # Extract latent features
-    latent_features = extract_latent_features(model, target_loader, device)
+    # Handle cases where either source or target stats are None
+    if mu_src is None or cov_src is None:
+        return mu_tgt, cov_tgt
+    if mu_tgt is None or cov_tgt is None:
+        return mu_src, cov_src
+        
+    # Blend means
+    mu_blend = alpha * mu_src + (1 - alpha) * mu_tgt
     
-    # Compute Mahalanobis statistics
-    mean, inv_cov = compute_mahala_stats(latent_features)
+    # Blend inverse covariances
+    cov_blend = alpha * cov_src + (1 - alpha) * cov_tgt
     
-    return mean, inv_cov
+    return mu_blend, cov_blend
+
+def calc_inv_cov_target_aware_latent(model, target_loader, device, alpha=0.7, use_ledoit_wolf=False):
+    """
+    Calculate blended mean and inverse covariance of latent features.
+    
+    Args:
+        model: The autoencoder model
+        target_loader: DataLoader for training data
+        device: Device to run computations on
+        alpha (float): Weight for source statistics (0-1)
+        use_ledoit_wolf (bool): Whether to use Ledoit-Wolf covariance estimation
+        
+    Returns:
+        tuple: (mean, inv_cov) for blended statistics
+    """
+    # Extract latent features from training data
+    train_features, train_filenames = extract_latent_features(model, target_loader, device)
+    
+    # Split training data into source and target
+    is_target = np.array(["target" in name for name in train_filenames])
+    is_source = np.logical_not(is_target)
+    
+    # Get source and target features
+    X_src = train_features[is_source]
+    X_tgt = train_features[is_target]
+    
+    # Compute statistics for source and target
+    mu_src, inv_cov_src = compute_latent_stats(X_src, use_ledoit_wolf)
+    mu_tgt, inv_cov_tgt = compute_latent_stats(X_tgt, use_ledoit_wolf)
+    
+    # Blend statistics
+    mu_blend, inv_cov_blend = blend_stats(mu_src, inv_cov_src, mu_tgt, inv_cov_tgt, alpha)
+    
+    return mu_blend, inv_cov_blend
 
 def loss_function_mahala_target_aware_latent(recon_x, x, mean, inv_cov):
     """
-    Compute target-aware Mahalanobis distance loss in latent space.
+    Compute blended Mahalanobis distance loss in latent space.
+    
+    Args:
+        recon_x: Latent features from encoder
+        x: Input features (not used, kept for compatibility)
+        mean: Blended mean vector
+        inv_cov: Blended inverse covariance matrix
+        
+    Returns:
+        torch.Tensor: Mahalanobis distances
     """
-    # Get latent features - no need to reshape since they're already in the right shape
+    # Get latent features
     feat = recon_x  # recon_x is actually the latent features z
     
     # Convert to numpy for computation
-    feat_np = feat.cpu().numpy().astype(np.float32)
+    feat_np = feat.detach().cpu().numpy().astype(np.float32)
     
     # Compute Mahalanobis distance
-    distances = mahalanobis_distance(feat_np, mean, inv_cov)
+    diff = feat_np - mean
+    distances = np.sqrt(np.sum(diff.dot(inv_cov) * diff, axis=1))
     
     # Convert back to torch tensor
     return torch.from_numpy(distances).to(feat.device).float()

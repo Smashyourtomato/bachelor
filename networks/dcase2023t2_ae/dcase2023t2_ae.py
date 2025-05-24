@@ -16,6 +16,7 @@ from networks.criterion.mahala import (
     calc_inv_cov_target_aware, loss_function_mahala_target_aware,
     calc_inv_cov_target_aware_latent, loss_function_mahala_target_aware_latent
 )
+from networks.criterion.mahala_blend import compute_blended_mahalanobis
 from tools.plot_anm_score import AnmScoreFigData
 from tools.plot_loss_curve import csv_to_figdata
 
@@ -286,6 +287,48 @@ class DCASE2023T2AE(BaseModel):
         y_pred.append(loss.mean().item())
         return y_pred
 
+    def calc_valid_mahala_score_blended(self, data, y_pred, alpha=0.7, use_ledoit_wolf=False):
+        """
+        Calculate blended Mahalanobis score for validation data.
+        
+        Args:
+            data (tuple): Batch data containing (tensor, labels, machine_ids, filenames)
+            y_pred (list): List to store predictions
+            alpha (float): Blending weight for source statistics (0-1)
+            use_ledoit_wolf (bool): Whether to use Ledoit-Wolf covariance estimation
+            
+        Returns:
+            list: Updated y_pred list with blended Mahalanobis scores
+        """
+        # Extract data tensor from batch
+        data_tensor = data[0]
+        data_tensor = data_tensor.to(self.device).float()
+        
+        # Get latent features
+        with torch.no_grad():  # Disable gradient computation
+            recon_data, z = self.model(data_tensor)
+            z_np = z.detach().cpu().numpy()  # Detach before converting to numpy
+        
+        # Split data into source and target
+        data_name_list = data[3]  # filenames
+        is_target_list = ["target" in name for name in data_name_list]
+        is_source_list = np.logical_not(is_target_list)
+        
+        z_src = z_np[is_source_list]
+        z_tgt = z_np[is_target_list]
+        
+        # Compute blended Mahalanobis distances
+        distances = compute_blended_mahalanobis(
+            X_src=z_src,
+            X_tgt=z_tgt,
+            X_test=z_np,
+            alpha=alpha,
+            use_ledoit_wolf=use_ledoit_wolf
+        )
+        
+        y_pred.extend(distances.tolist())
+        return y_pred
+
     def loss_reduction_1d(self, score):
         return torch.mean(score, dim=1)
 
@@ -320,13 +363,27 @@ class DCASE2023T2AE(BaseModel):
         self.model.eval()
 
         if self.args.score == "MAHALA":
-            # Calculate target-aware Mahalanobis parameters once
-            print("\n============== CALCULATING TARGET DISTRIBUTION ==============")
-            # Use latent space for Mahalanobis scoring
+            # Calculate blended Mahalanobis scores by default
+            print("\n============== CALCULATING BLENDED MAHALANOBIS SCORES ==============")
+            y_pred = []
+            for batch_idx, batch in enumerate(tqdm(self.train_loader)):
+                y_pred = self.calc_valid_mahala_score_blended(
+                    data=batch,
+                    y_pred=y_pred,
+                    alpha=self.args.blend_alpha if hasattr(self.args, 'blend_alpha') else 0.7,
+                    use_ledoit_wolf=self.args.use_ledoit_wolf if hasattr(self.args, 'use_ledoit_wolf') else False
+                )
+            decision_threshold = self.calc_decision_threshold(score_distr_file_path=self.mahala_score_distr_file_path)
+        elif self.args.score == "MAHALA_ORIGINAL":
+            # Original Mahalanobis approach with blending
+            print("\n============== CALCULATING BLENDED TARGET DISTRIBUTION ==============")
+            # Use latent space for Mahalanobis scoring with blending
             self.mahala_mean, self.mahala_inv_cov = calc_inv_cov_target_aware_latent(
                 model=self.model,
                 target_loader=self.train_loader,
-                device=self.device
+                device=self.device,
+                alpha=self.args.blend_alpha if hasattr(self.args, 'blend_alpha') else 0.7,
+                use_ledoit_wolf=self.args.use_ledoit_wolf if hasattr(self.args, 'use_ledoit_wolf') else False
             )
             decision_threshold = self.calc_decision_threshold(score_distr_file_path=self.mahala_score_distr_file_path)
         else:
@@ -492,6 +549,15 @@ class DCASE2023T2AE(BaseModel):
             recon_data, z = self.model(data)
 
             if self.args.score == "MAHALA":
+                # Use blended Mahalanobis approach by default
+                loss = self.calc_valid_mahala_score_blended(
+                    data=batch,
+                    y_pred=[],
+                    alpha=self.args.blend_alpha if hasattr(self.args, 'blend_alpha') else 0.7,
+                    use_ledoit_wolf=self.args.use_ledoit_wolf if hasattr(self.args, 'use_ledoit_wolf') else False
+                )
+                y_pred.append(loss[0])  # Get the first (and only) score
+            elif self.args.score == "MAHALA_ORIGINAL":
                 # Use pre-computed target distribution parameters with latent features
                 loss = loss_function_mahala_target_aware_latent(
                     recon_x=z,

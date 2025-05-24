@@ -11,6 +11,13 @@ def yaml_load():
     return param
 
 def param_to_args_list(params):
+    # Remove blend_alpha and use_ledoit_wolf from params if they exist
+    params = params.copy()
+    if 'blend_alpha' in params:
+        del params['blend_alpha']
+    if 'use_ledoit_wolf' in params:
+        del params['use_ledoit_wolf']
+        
     params = list(itertools.chain.from_iterable(zip(params.keys(), params.values())))
     args_list = []
     for param in params:
@@ -41,9 +48,14 @@ def get_argparse():
             description='Main function to call training for different AutoEncoders')
     parser.add_argument('--model', type=str, default='DCASE2023T2-AE', metavar='N',
                         help='train model name')
-    parser.add_argument('--score', type=str, default="MSE", choices=["MSE", "MAHALA"])
+    parser.add_argument('--score', type=str, default="MSE", choices=["MSE", "MAHALA", "MAHALA_ORIGINAL"])
     parser.add_argument('--seed', type=int, default=39876401, metavar='S',
                         help='random seed (default: 39876401)')
+    
+    parser.add_argument('--blend_alpha', type=float, default=0.7,
+                        help='Weight for blending source and target statistics (0-1)')
+    parser.add_argument('--use_ledoit_wolf', type=str2bool, default=False,
+                        help='Whether to use Ledoit-Wolf covariance estimation')
     
     parser.add_argument('--use_cuda', type=str2bool, default=True,
                         help='enables CUDA training')

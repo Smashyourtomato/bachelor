@@ -19,6 +19,13 @@ def main():
     args = parser.parse_args(args=flat_param)
     # read parameters from command line
     args = parser.parse_args(namespace=args)
+    
+    # Remove blend_alpha and use_ledoit_wolf from args if they were passed directly
+    if hasattr(args, 'blend_alpha') and args.blend_alpha == '0.7':
+        args.blend_alpha = 0.7
+    if hasattr(args, 'use_ledoit_wolf') and args.use_ledoit_wolf == 'False':
+        args.use_ledoit_wolf = False
+        
     print(args)
 
     if args.train_only and args.test_only:
@@ -50,7 +57,6 @@ def main():
         train=train,
         test=test
     )
-
 
     print(args.model)
 
